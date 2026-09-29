@@ -19,7 +19,6 @@ Coverage targets:
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,7 +27,6 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
-from gateway.session_identity import RoutingIdentity
 
 
 def _make_source(
@@ -37,7 +35,6 @@ def _make_source(
     user_id: str = "user1",
     chat_type: str = "dm",
     chat_id: str = "c1",
-    profile: str | None = None,
 ) -> SessionSource:
     return SessionSource(
         platform=platform,
@@ -45,7 +42,6 @@ def _make_source(
         chat_id=chat_id,
         user_name=f"name-{user_id}",
         chat_type=chat_type,
-        profile=profile,
     )
 
 
@@ -54,13 +50,11 @@ def _make_event(text: str, source: SessionSource) -> MessageEvent:
 
 
 def _make_runner(*, platform_extra: dict | None = None,
-                 platform: Platform = Platform.DISCORD,
-                 multiplex_profiles: bool = False):
+                 platform: Platform = Platform.DISCORD):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        multiplex_profiles=multiplex_profiles,
         platforms={
             platform: PlatformConfig(
                 enabled=True,
@@ -95,8 +89,6 @@ def _make_runner(*, platform_extra: dict | None = None,
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner._running_agents = {}
-    runner._primary_profile_name = "primary"
-    runner._profile_configs = {}
     runner._running_agents_ts = {}
     runner._session_run_generation = {}
     runner._pending_messages = {}
@@ -139,49 +131,6 @@ async def test_whoami_non_admin_lists_runnable_commands():
     assert "/whoami" in result    # always-allowed floor
     assert "/status" in result
     assert "/model" in result
-
-
-@pytest.mark.asyncio
-async def test_secondary_profile_slash_policy_uses_its_own_config():
-    """#121705: a bot configured only in a secondary profile is gated by THAT profile's
-    ``allow_admin_from``; the launch profile's empty policy must not make it unrestricted."""
-    runner = _make_runner(multiplex_profiles=True)
-    runner._profile_configs["beta"] = GatewayConfig(
-        platforms={
-            Platform.DISCORD: PlatformConfig(
-                enabled=True,
-                extra={"allow_admin_from": ["admin"], "user_allowed_commands": ["status"]},
-            )
-        }
-    )
-    user = _make_source(user_id="user", profile="beta")
-    denied = runner._check_slash_access(user, "restart")
-    assert denied is not None and "⛔" in denied
-    assert "Tier: user" in await runner._handle_whoami_command(_make_event("/whoami", user))
-    assert runner._resume_caller_is_admin(user) is False
-
-    admin = _make_source(user_id="admin", profile="beta")
-    assert runner._check_slash_access(admin, "restart") is None
-    assert runner._resume_caller_is_admin(admin) is True
-
-    # The launch profile's own (ungated) bot stays ungated ...
-    assert runner._check_slash_access(_make_source(user_id="user"), "restart") is None
-    # ... including a turn ROUTED to beta: ``allow_admin_from`` is per bot, so the bot-owning
-    # (transport) profile's config decides, the owner ``authorization_home`` already names.
-    routed = _make_source(user_id="user", profile="beta")
-    routed._identity = RoutingIdentity(
-        transport_profile="primary", runtime_profile="beta",
-        authorization_home=Path("/profiles/primary"), runtime_home=Path("/profiles/beta"),
-    )
-    assert runner._check_slash_access(routed, "restart") is None
-
-
-def test_missing_secondary_profile_config_fails_closed():
-    """A served profile whose config is not cached must not inherit the launch profile's open policy."""
-    runner = _make_runner(multiplex_profiles=True)
-    denied = runner._check_slash_access(_make_source(user_id="user", profile="beta"), "restart")
-    assert denied is not None and "⛔" in denied
-    assert runner._check_slash_access(_make_source(user_id="user", profile="beta"), "help") is None
 
 
 @pytest.mark.asyncio
@@ -271,6 +220,68 @@ async def test_blank_chat_type_resolves_to_gated_scope():
 # ---------------------------------------------------------------------------
 # Plugin-registered slash commands are gated through the same path
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_allowed_plugin_command_receives_narrow_gateway_context(monkeypatch):
+    """Only opt-in plugin handlers receive the session-operation context."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": ["nova"],
+        }
+    )
+    received: dict[str, object] = {}
+
+    async def handler(raw_args, command_context):
+        received["args"] = raw_args
+        received["context"] = command_context
+        return "new story ready"
+
+    import hermes_cli.plugins as plugin_api
+    monkeypatch.setattr(
+        plugin_api,
+        "get_plugin_command_entry",
+        lambda name: {"handler": handler, "gateway_context": True} if name == "nova" else None,
+    )
+
+    result = await runner._handle_message(
+        _make_event("/nova My story", _make_source(user_id="999"))
+    )
+
+    assert result == "new story ready"
+    assert received["args"] == "My story"
+    context = received["context"]
+    assert context.__class__.__name__ == "GatewayPluginCommandContext"
+    assert not hasattr(context, "runner")
+
+
+@pytest.mark.asyncio
+async def test_unlisted_plugin_command_is_denied_before_handler(monkeypatch):
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    called = False
+
+    async def handler(*_args):
+        nonlocal called
+        called = True
+        return "must not run"
+
+    import hermes_cli.plugins as plugin_api
+    monkeypatch.setattr(
+        plugin_api,
+        "get_plugin_command_entry",
+        lambda name: {"handler": handler, "gateway_context": True} if name == "nova" else None,
+    )
+
+    result = await runner._handle_message(_make_event("/nova", _make_source(user_id="999")))
+
+    assert "⛔" in result
+    assert called is False
 
 
 @pytest.mark.asyncio
